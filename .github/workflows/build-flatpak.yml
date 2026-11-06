@@ -1,0 +1,258 @@
+name: Build Flatpak (no web tabs)
+
+# Checks once a day whether mjonuschat/PrusaSlicer has a new STABLE release tag
+# (version_X.Y.Z+boss, no -rc/-beta/nightly). If there is one that has not been
+# built here yet, it checks out that tag, applies patches/no-webview-tabs.patch,
+# builds the flatpak and publishes it as a GitHub Release in this repository.
+# A day with no new release costs a few seconds.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to build, e.g. version_2.9.7+boss (blank = newest stable)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPO: mjonuschat/PrusaSlicer
+
+jobs:
+  check:
+    name: Look for a new release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      build: ${{ steps.pick.outputs.build }}
+    steps:
+      - name: Pick tag and decide whether to build
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TAG}" ]; then
+            tag="${INPUT_TAG}"
+          else
+            tag=$(git ls-remote --tags "https://github.com/${UPSTREAM_REPO}.git" 'refs/tags/version_*+boss' \
+              | awk '{print $2}' | sed 's#^refs/tags/##' \
+              | grep -E '^version_[0-9]+\.[0-9]+\.[0-9]+\+boss$' \
+              | sort -V | tail -n1)
+          fi
+          if [ -z "${tag}" ]; then
+            echo "::error::No stable version_*+boss tag found upstream"
+            exit 1
+          fi
+          echo "Newest stable upstream tag: ${tag}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+          build=true
+          if gh release view "${tag}-nowebview" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Already built: ${tag}-nowebview exists."
+            build=false
+          elif [ -z "${INPUT_TAG}" ]; then
+            # Don't retry every day after a failure: an open failure issue pauses
+            # the schedule for that tag. Close the issue or run manually to retry.
+            open=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+              --search "\"Build failed for ${tag}\" in:title" --json number --jq 'length' || echo 0)
+            if [ "${open}" != "0" ]; then
+              echo "An open failure issue exists for ${tag}; skipping."
+              build=false
+            fi
+          fi
+          echo "build=${build}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Patch and build flatpak
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
+      options: --privileged
+    env:
+      UP_TAG: ${{ needs.check.outputs.tag }}
+    steps:
+      - name: Checkout upstream release tag
+        uses: actions/checkout@v6
+        with:
+          repository: mjonuschat/PrusaSlicer
+          ref: refs/tags/${{ needs.check.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Checkout patch files from this repository
+        uses: actions/checkout@v6
+        with:
+          path: .nowebview
+
+      - name: Apply patch and commit it
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # flatpak-builder clones this repo from file://, so the patched tree
+          # must be a real commit on a branch.
+          git switch -c nowebview
+          git apply --index .nowebview/patches/no-webview-tabs.patch
+          git commit -m "Disable Printables and Physical Printer web view tabs"
+          git log --oneline -n 2
+
+      - name: Setup build environment
+        shell: bash
+        run: |
+          ver_pure=$(grep 'set(SLIC3R_VERSION' version.inc | cut -d '"' -f2)
+          echo "ver_pure=$ver_pure" >> $GITHUB_ENV
+          echo "date=$(date +'%Y%m%d')" >> $GITHUB_ENV
+          echo "date_long=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
+          echo "bundle=PrusaSlicer-${ver_pure}+BOSS+Linux-nowebview-$(date +'%Y%m%d').flatpak" >> $GITHUB_ENV
+          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE" >> $GITHUB_ENV
+
+      - name: Setup cmake
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.31'
+
+      - name: Determine cache keys
+        id: cache-keys
+        run: |
+          echo cache-path=${{ github.workspace }}/.flatpak-builder >> "$GITHUB_OUTPUT"
+          echo cache-key=Linux_x86_64-cache-deps-${{ hashFiles('deps/**') }} >> "$GITHUB_OUTPUT"
+
+      - name: Restore build dependencies cache
+        id: cache-build-deps-restore
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ steps.cache-keys.outputs.cache-path }}
+          key: ${{ steps.cache-keys.outputs.cache-key }}
+
+      - name: Update metainfo
+        shell: bash
+        run: |
+          f=.flatpak/io.github.mjonuschat.PrusaSlicer.metainfo.xml
+          sed --in-place -e "s/\"nightly\"/\"${ver_pure}\"/g" "$f"
+          sed --in-place -e "s/2024-09-19/${date_long}/g" "$f"
+
+      - name: Point the flatpak manifest at the patched commit
+        shell: bash
+        run: |
+          # Pin deps to the last commit touching deps/ (keeps flatpak-builder's
+          # module cache valid), and the app itself to the patched HEAD.
+          deps_commit=$(git log -1 --format=%H -- deps/)
+          if [ -z "$deps_commit" ]; then
+            echo "::error::No commit found touching deps/"
+            exit 1
+          fi
+          head_commit=$(git rev-parse HEAD)
+
+          flatpak-builder --show-manifest .flatpak/io.github.mjonuschat.PrusaSlicer.yml | \
+            jq --arg depsCommit "$deps_commit" --arg headCommit "$head_commit" \
+              '.modules[] |= if .name == "PrusaSlicerDeps" then
+                  (.sources[] |= if .type == "dir" and .path == ".." then
+                      {
+                          "type": "git",
+                          "url": "file://${{ env.GITHUB_WORKSPACE }}",
+                          "commit": $depsCommit,
+                          "disable-lfs": true
+                      }
+                  else . end)
+              elif .name == "PrusaSlicer" then
+                  (.sources[] |= if .type == "dir" and .path == ".." then
+                      {
+                          "type": "git",
+                          "url": "file://${{ env.GITHUB_WORKSPACE }}",
+                          "commit": $headCommit,
+                          "disable-lfs": true
+                      }
+                  else . end)
+              else . end' > .flatpak/io.github.mjonuschat.PrusaSlicer.json
+
+      - name: Build dependencies
+        if: steps.cache-build-deps-restore.outputs.cache-hit != 'true'
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: PrusaSlicer-Dependencies.flatpak
+          stop-at-module: PrusaSlicer
+          manifest-path: .flatpak/io.github.mjonuschat.PrusaSlicer.json
+          cache: false
+          arch: x86_64
+          upload-artifact: false
+
+      - name: Build PrusaSlicer flatpak
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: ${{ env.bundle }}
+          manifest-path: .flatpak/io.github.mjonuschat.PrusaSlicer.json
+          cache: false
+          arch: x86_64
+          upload-artifact: false
+
+      # Save after the full build (and also after a failed one) so the next
+      # attempt can reuse the dependency stages.
+      - name: Save build dependencies cache
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ steps.cache-keys.outputs.cache-path }}
+          key: ${{ steps.cache-build-deps-restore.outputs.cache-primary-key }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: flatpak-bundle
+          path: ${{ env.bundle }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: flatpak-bundle
+          path: dist
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UP_TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ver="${UP_TAG#version_}"
+          ver="${ver%+boss}"
+          gh release create "${UP_TAG}-nowebview" dist/*.flatpak \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "PrusaSlicer ${ver} (BOSS) - no Printables / Physical Printer web tabs" \
+            --notes "Automated build of upstream tag \`${UP_TAG}\` from https://github.com/mjonuschat/PrusaSlicer with the Printables and Physical Printer web view tabs removed. Everything else is unchanged. See the upstream release page for the changelog."
+
+  notify_failure:
+    name: Report failure
+    needs: [check, build, release]
+    if: failure() && needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open an issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UP_TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "Build failed for ${UP_TAG}" \
+            --body "The build for \`${UP_TAG}\` failed. Most likely the patch no longer applies to this release, or the build itself broke. Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+          While this issue is open the daily check skips this tag. Close it (or run the workflow manually) to retry."
