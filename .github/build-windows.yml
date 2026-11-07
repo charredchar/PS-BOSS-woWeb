@@ -1,0 +1,185 @@
+name: Build Windows
+
+# Reusable build for the Windows portable zip and installer, on a GitHub-hosted
+# runner. Called by build.yml, or run by hand to test just this build.
+# It only produces workflow artifacts; build.yml publishes the release.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Upstream tag, e.g. version_2.9.7+boss"
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag, e.g. version_2.9.7+boss"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Patch and build Windows
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      # Keep LF line endings so the patch applies, and allow long paths for the deps build.
+      - name: Git settings
+        shell: bash
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+
+      - name: Checkout upstream release tag
+        uses: actions/checkout@v6
+        with:
+          repository: mjonuschat/PrusaSlicer
+          ref: refs/tags/${{ inputs.tag }}
+
+      - name: Checkout patch and installer files from this repository
+        uses: actions/checkout@v6
+        with:
+          path: .nowebview
+
+      - name: Apply patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply .nowebview/patches/no-webview-tabs.patch
+          git status --short | grep -v '^?? .nowebview' || true
+
+      - name: Setup build environment
+        shell: pwsh
+        run: |
+          $versionContent = Get-Content version.inc -Raw
+          if ($versionContent -match 'set\(SLIC3R_VERSION "(.*?)"\)') {
+              $ver_pure = $matches[1]
+          } else {
+              throw "Could not read SLIC3R_VERSION from version.inc"
+          }
+          $date = Get-Date -Format 'yyyyMMdd'
+          "ver=$ver_pure+BOSS" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+          "zip=PrusaSlicer-$ver_pure+BOSS+win64-nowebview-$date.zip" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+          "installer=PrusaSlicer-Installer-$ver_pure+BOSS+win64-nowebview-$date.exe" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+
+      - name: Setup cmake
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.31'
+
+      - name: Setup MSVC
+        uses: egor-tensin/vs-shell@v2
+
+      - name: Install Strawberry Perl
+        run: choco install strawberryperl -y --no-progress
+        shell: pwsh
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+        shell: pwsh
+
+      - name: Determine cache keys
+        id: cache-keys
+        shell: pwsh
+        run: |
+          "cache-path=${{ github.workspace }}/deps/build/destdir" | Out-File -Append -FilePath $env:GITHUB_OUTPUT -Encoding utf8
+          "cache-key=${{ runner.os }}-deps-${{ hashFiles('deps/**/CMakeLists.txt', 'deps/**/*.cmake', 'deps/**/*.patch') }}" | Out-File -Append -FilePath $env:GITHUB_OUTPUT -Encoding utf8
+
+      - name: Restore build dependencies cache
+        id: cache-build-deps-restore
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ steps.cache-keys.outputs.cache-path }}
+          key: ${{ steps.cache-keys.outputs.cache-key }}
+
+      - name: Build dependencies
+        if: steps.cache-build-deps-restore.outputs.cache-hit != 'true'
+        working-directory: ${{ github.workspace }}
+        run: cmake -P build.cmake -- --target deps
+        shell: pwsh
+
+      - name: Save build dependencies cache
+        if: steps.cache-build-deps-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ steps.cache-keys.outputs.cache-path }}
+          key: ${{ steps.cache-build-deps-restore.outputs.cache-primary-key }}
+
+      - name: Build PrusaSlicer
+        working-directory: ${{ github.workspace }}
+        run: cmake -P build.cmake -- --target slicer
+        shell: pwsh
+
+      - name: Stage launcher binary for packaging
+        working-directory: ${{ github.workspace }}/build/src
+        run: |
+          copy slic3r-app-launcher\slic3r-app-launcher.exe PrusaSlicer.exe
+          copy slic3r-app-launcher\libgmp-10.dll .
+          copy slic3r-app-launcher\libmpfr-4.dll .
+          copy slic3r-app-launcher\OCCTWrapper.dll .
+          copy slic3r-app-launcher\WebView2Loader.dll .
+          New-Item -ItemType Junction -Path resources -Target "$PWD\slic3r-app-launcher\resources"
+        shell: pwsh
+
+      - name: Provide Mesa software OpenGL fallback
+        working-directory: ${{ github.workspace }}/build/src
+        run: |
+          mkdir mesa
+          curl.exe -L -o mesa.7z https://download.qt.io/development_releases/prebuilt/llvmpipe/windows/opengl32sw-64-mesa_12_0_rc2.7z
+          7z e mesa.7z -omesa opengl32sw.dll
+          move mesa\opengl32sw.dll mesa\opengl32.dll
+          del mesa.7z
+        shell: pwsh
+
+      - name: Resolve VC++ runtime path
+        id: vcrt
+        run: |
+          $crtPath = Get-ChildItem "$env:VCToolsRedistDir\x64\Microsoft.VC*.CRT" -Directory | Select-Object -First 1
+          "crt-path=$($crtPath.FullName)" | Out-File -Append -FilePath $env:GITHUB_OUTPUT -Encoding utf8
+          echo "Resolved VC++ CRT path: $($crtPath.FullName)"
+        shell: pwsh
+
+      - name: Copy VC++ runtime for portable zip
+        working-directory: ${{ github.workspace }}/build/src
+        run: |
+          copy "${{ steps.vcrt.outputs.crt-path }}\vcruntime140.dll" .
+          copy "${{ steps.vcrt.outputs.crt-path }}\vcruntime140_1.dll" .
+          copy "${{ steps.vcrt.outputs.crt-path }}\msvcp140.dll" .
+          copy "${{ steps.vcrt.outputs.crt-path }}\msvcp140_codecvt_ids.dll" .
+        shell: pwsh
+
+      - name: Create installer
+        shell: pwsh
+        run: |
+          $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          & $iscc /DBuildDir="${{ github.workspace }}\build\src" /DVersion="${{ env.ver }}" /DVCRedistCRT="${{ steps.vcrt.outputs.crt-path }}" /DOutputDir="${{ github.workspace }}\build" "${{ github.workspace }}\.nowebview\installer\installer.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          Rename-Item -Path "${{ github.workspace }}\build\PrusaSlicer-Installer-${{ env.ver }}.exe" -NewName "${{ env.installer }}"
+
+      - name: Pack portable app
+        working-directory: ${{ github.workspace }}/build/src
+        run: |
+          7z a -tzip ${{ github.workspace }}\build\${{ env.zip }} resources *.exe *.dll mesa/opengl32.dll
+          7z l ${{ github.workspace }}\build\${{ env.zip }}
+        shell: pwsh
+
+      - name: Upload portable zip
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-portable
+          path: ${{ github.workspace }}\build\${{ env.zip }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-installer
+          path: ${{ github.workspace }}\build\${{ env.installer }}
+          if-no-files-found: error
+          retention-days: 7
