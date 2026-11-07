@@ -114,16 +114,18 @@ jobs:
         run: cmake -P build.cmake -- --target slicer
         shell: pwsh
 
-      - name: Stage launcher binary for packaging
+      # At the 2.9.x tags the build already assembles everything in build/src:
+      # prusa-slicer.exe, prusa-slicer-console.exe, prusa-gcodeviewer.exe,
+      # PrusaSlicer.dll, the DLLs and a "resources" junction. There is no launcher
+      # to stage (that is 3.0), so just check the output and fail clearly if not.
+      - name: Verify build output
         working-directory: ${{ github.workspace }}/build/src
-        run: |
-          copy slic3r-app-launcher\slic3r-app-launcher.exe PrusaSlicer.exe
-          copy slic3r-app-launcher\libgmp-10.dll .
-          copy slic3r-app-launcher\libmpfr-4.dll .
-          copy slic3r-app-launcher\OCCTWrapper.dll .
-          copy slic3r-app-launcher\WebView2Loader.dll .
-          New-Item -ItemType Junction -Path resources -Target "$PWD\slic3r-app-launcher\resources"
         shell: pwsh
+        run: |
+          Get-ChildItem -Name | Sort-Object
+          $expected = 'prusa-slicer.exe','prusa-slicer-console.exe','prusa-gcodeviewer.exe','PrusaSlicer.dll','OCCTWrapper.dll','WebView2Loader.dll','libgmp-10.dll','libmpfr-4.dll','resources'
+          $missing = $expected | Where-Object { -not (Test-Path $_) }
+          if ($missing) { throw "Missing from build/src: $($missing -join ', ')" }
 
       - name: Provide Mesa software OpenGL fallback
         working-directory: ${{ github.workspace }}/build/src
