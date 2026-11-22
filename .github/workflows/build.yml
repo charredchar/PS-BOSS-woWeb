@@ -78,6 +78,39 @@ jobs:
           fi
           echo "build=${build}" >> "$GITHUB_OUTPUT"
 
+  # Keeps the Actions history clean: deletes EARLIER runs of this workflow that
+  # finished successfully without building anything (the daily "nothing new"
+  # checks). Runs that built something or failed are never touched. The current
+  # run can't delete itself while it is still running, so the most recent
+  # no-op run stays until the next run removes it.
+  tidy:
+    name: Tidy old no-op runs
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Delete earlier no-op runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          wf_id=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" --jq .workflow_id)
+          gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf_id}/runs?status=completed&per_page=100" \
+            --jq '.workflow_runs[] | select(.conclusion == "success") | .id' |
+          while read -r id; do
+            [ "${id}" = "${GITHUB_RUN_ID}" ] && continue
+            # Jobs that actually ran, other than the check and this tidy job.
+            others=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${id}/jobs?per_page=100" \
+              --jq '[.jobs[] | select(.conclusion != "skipped" and .name != "Look for a new release" and .name != "Tidy old no-op runs")] | length')
+            if [ "${others}" = "0" ]; then
+              echo "Deleting no-op run ${id}"
+              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/runs/${id}" || echo "Could not delete ${id}"
+            fi
+          done
+
   build_linux_x86_64:
     name: Linux x86_64
     needs: check
